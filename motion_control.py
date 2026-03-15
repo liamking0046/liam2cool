@@ -22,6 +22,9 @@ class MotionConfig:
     hand_boost: float = 0.35
     temporal_smooth: float = 0.2
     identity_lock: float = 0.45
+    structure_lock: float = 0.55
+    lighting_transfer: float = 0.35
+    flow_momentum: float = 0.45
 
 
 class MotionControlGenerator:
@@ -160,6 +163,23 @@ class MotionControlGenerator:
         mask = cv2.GaussianBlur(emphasized.astype(np.float32), (0, 0), 3)
         return np.clip(mask, 0.0, 1.0)
 
+    @staticmethod
+    def _build_grid_flow(flow: np.ndarray, grid_step: int = 18) -> np.ndarray:
+        h, w = flow.shape[:2]
+        grid_h = max(2, h // grid_step)
+        grid_w = max(2, w // grid_step)
+
+        small = cv2.resize(flow, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
+        smooth_small = cv2.GaussianBlur(small, (0, 0), 1.0)
+        return cv2.resize(smooth_small, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    def _stabilize_flow(self, flow: np.ndarray, prev_flow: np.ndarray | None) -> np.ndarray:
+        grid_flow = self._build_grid_flow(flow)
+        momentum = float(np.clip(self.config.flow_momentum, 0.0, 0.85))
+        if prev_flow is None:
+            return grid_flow
+        return cv2.addWeighted(grid_flow, 1.0 - momentum, prev_flow, momentum, 0.0)
+
     def _apply_identity_lock(self, frame: np.ndarray, source: np.ndarray) -> np.ndarray:
         lock = float(np.clip(self.config.identity_lock, 0.0, 1.0))
         if lock <= 0:
@@ -181,6 +201,48 @@ class MotionControlGenerator:
         color_matched = cv2.cvtColor(color_matched, cv2.COLOR_LAB2BGR)
 
         return cv2.addWeighted(frame, 1.0 - lock, color_matched, lock, 0.0)
+
+    def _apply_structure_lock(self, moved: np.ndarray, source: np.ndarray) -> np.ndarray:
+        lock = float(np.clip(self.config.structure_lock, 0.0, 1.0))
+        if lock <= 0:
+            return moved
+
+        moved_gray = cv2.cvtColor(moved, cv2.COLOR_BGR2GRAY)
+        source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+
+        moved_edges = cv2.Canny(moved_gray, 80, 170)
+        source_edges = cv2.Canny(source_gray, 80, 170)
+
+        moved_edges = cv2.GaussianBlur(moved_edges, (0, 0), 1.3).astype(np.float32) / 255.0
+        source_edges = cv2.GaussianBlur(source_edges, (0, 0), 1.3).astype(np.float32) / 255.0
+
+        edge_mix = np.clip(0.2 + source_edges * 0.8, 0.0, 1.0)
+        edge_mix = cv2.GaussianBlur(edge_mix, (0, 0), 2)
+        edge_mix = np.repeat(edge_mix[:, :, None], 3, axis=2)
+
+        locked = moved.astype(np.float32) * (1.0 - lock * edge_mix) + source.astype(np.float32) * (lock * edge_mix)
+        return np.clip(locked, 0, 255).astype(np.uint8)
+
+    def _transfer_lighting(self, frame: np.ndarray, ref_frame: np.ndarray) -> np.ndarray:
+        amount = float(np.clip(self.config.lighting_transfer, 0.0, 1.0))
+        if amount <= 0:
+            return frame
+
+        frame_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        ref_lab = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2LAB)
+
+        frame_l, frame_a, frame_b = cv2.split(frame_lab)
+        ref_l, _, _ = cv2.split(ref_lab)
+
+        ref_l_blur = cv2.GaussianBlur(ref_l, (0, 0), 7)
+        frame_l_blur = cv2.GaussianBlur(frame_l, (0, 0), 7)
+
+        relight = frame_l.astype(np.float32) + (ref_l_blur.astype(np.float32) - frame_l_blur.astype(np.float32))
+        relight = np.clip(relight, 0, 255).astype(np.uint8)
+
+        mixed_l = cv2.addWeighted(frame_l, 1.0 - amount, relight, amount, 0)
+        out = cv2.merge((mixed_l, frame_a, frame_b))
+        return cv2.cvtColor(out, cv2.COLOR_LAB2BGR)
 
     def _apply_look(self, frame: np.ndarray, prev_stylized: np.ndarray | None) -> np.ndarray:
         if self.config.look == "natural" or self.config.look_strength <= 0:
@@ -233,21 +295,25 @@ class MotionControlGenerator:
         generated = src.copy()
         prev_ref_gray = cv2.cvtColor(ref_frames[0], cv2.COLOR_BGR2GRAY)
         prev_stylized: np.ndarray | None = None
+        prev_flow: np.ndarray | None = None
 
         first_frame = self._apply_look(generated, prev_stylized)
         writer.write(first_frame)
         prev_stylized = first_frame
 
         for i in tqdm(range(1, len(ref_frames)), desc="Transferring motion"):
-            curr_ref_gray = cv2.cvtColor(ref_frames[i], cv2.COLOR_BGR2GRAY)
+            ref_frame = ref_frames[i]
+            curr_ref_gray = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY)
 
             H = self._estimate_global_transform(prev_ref_gray, curr_ref_gray)
             flow = self._dense_flow(prev_ref_gray, curr_ref_gray)
+            stabilized_flow = self._stabilize_flow(flow, prev_flow)
 
             moved = self._warp_with_homography(generated, H, self.config.global_scale)
-            moved = self._warp_with_flow(moved, flow, self.config.flow_scale)
+            moved = self._warp_with_flow(moved, stabilized_flow, self.config.flow_scale)
+            moved = self._apply_structure_lock(moved, src)
 
-            mask = self._motion_focus_mask(flow, h, w)
+            mask = self._motion_focus_mask(stabilized_flow, h, w)
             mask_3 = np.repeat(mask[:, :, None], 3, axis=2)
 
             motion_mixed = (moved.astype(np.float32) * mask_3) + (generated.astype(np.float32) * (1.0 - mask_3))
@@ -261,6 +327,7 @@ class MotionControlGenerator:
                 0,
             )
             blended = self._apply_identity_lock(blended, src)
+            blended = self._transfer_lighting(blended, ref_frame)
 
             temporal_smooth = float(np.clip(self.config.temporal_smooth, 0.0, 0.4))
             generated = cv2.addWeighted(blended, 1.0 - temporal_smooth, generated, temporal_smooth, 0.0)
@@ -271,6 +338,7 @@ class MotionControlGenerator:
             writer.write(stylized)
             prev_stylized = stylized
             prev_ref_gray = curr_ref_gray
+            prev_flow = stabilized_flow
 
         writer.release()
 
@@ -358,6 +426,24 @@ def parse_args() -> argparse.Namespace:
         default=0.45,
         help="Preserve source-character color identity from 0.0 to 1.0.",
     )
+    parser.add_argument(
+        "--structure-lock",
+        type=float,
+        default=0.55,
+        help="Preserve source edge structure to reduce rubbery deformation from 0.0 to 1.0.",
+    )
+    parser.add_argument(
+        "--lighting-transfer",
+        type=float,
+        default=0.35,
+        help="Transfer low-frequency reference lighting into generated frames from 0.0 to 1.0.",
+    )
+    parser.add_argument(
+        "--flow-momentum",
+        type=float,
+        default=0.45,
+        help="Smooth optical flow trajectory over time from 0.0 to 0.85.",
+    )
     return parser.parse_args()
 
 
@@ -376,6 +462,9 @@ def main() -> None:
         hand_boost=args.hand_boost,
         temporal_smooth=args.temporal_smooth,
         identity_lock=args.identity_lock,
+        structure_lock=args.structure_lock,
+        lighting_transfer=args.lighting_transfer,
+        flow_momentum=args.flow_momentum,
     )
 
     generator = MotionControlGenerator(cfg)
@@ -385,4 +474,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
+       
+      
+         
