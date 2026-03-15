@@ -19,7 +19,7 @@ if ($MaxFrames -gt 0) {
     $maxFramesArg = "--max-frames $MaxFrames"
 }
 
-python motion_control.py `
+py motion_control.py `
     --source "$Source" `
     --reference "$Reference" `
     --output "$Output" `
