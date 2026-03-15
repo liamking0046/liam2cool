@@ -27,3 +27,4 @@ python motion_control.py `
     --global-scale $GlobalScale `
     --blend-strength $BlendStrength `
     $maxFramesArg
+
