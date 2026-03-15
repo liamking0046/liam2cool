@@ -20,7 +20,10 @@ param(
     [double]$MotionFocus = 0.6,
     [double]$HandBoost = 0.35,
     [double]$TemporalSmooth = 0.2,
-    [double]$IdentityLock = 0.45
+    [double]$IdentityLock = 0.45,
+    [double]$StructureLock = 0.55,
+    [double]$LightingTransfer = 0.35,
+    [double]$FlowMomentum = 0.45
 )
 
 function Test-VideoPath([string]$Path) {
@@ -50,7 +53,10 @@ $pythonArgs = @(
     '--motion-focus', $MotionFocus,
     '--hand-boost', $HandBoost,
     '--temporal-smooth', $TemporalSmooth,
-    '--identity-lock', $IdentityLock
+    '--identity-lock', $IdentityLock,
+    '--structure-lock', $StructureLock,
+    '--lighting-transfer', $LightingTransfer,
+    '--flow-momentum', $FlowMomentum
 )
 
 if ($MaxFrames -gt 0) {
@@ -58,8 +64,3 @@ if ($MaxFrames -gt 0) {
 }
 
 python @pythonArgs
-
-
-
-
-
