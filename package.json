@@ -5,6 +5,7 @@
   "description": "npm entrypoint wrapper for the Python motion-control video generator",
   "scripts": {
     "start": "node scripts/start.js",
-    "check": "python -m py_compile motion_control.py"
+    "check": "python -m py_compile motion_control.py",
+    "setup:advanced": "powershell -ExecutionPolicy Bypass -File ./setup_advanced_backend.ps1"
   }
 }
